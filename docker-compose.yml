@@ -1,0 +1,16 @@
+version: "3.4"
+
+x-common-build: &common-build
+  image: rust:latest
+  working_dir: /src
+  volumes:
+    - .:/src
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun
+
+services:
+  rust_tcp:
+    <<: *common-build
+    command: ["make", "run"]
