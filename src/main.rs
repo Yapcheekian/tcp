@@ -1,8 +1,20 @@
+use std::collections::HashMap;
 use std::io;
+use std::net::Ipv4Addr;
 
 use tun_tap;
 
+mod tcp;
+
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+struct Quad {
+    src: (Ipv4Addr, u16),
+    dst: (Ipv4Addr, u16),
+}
+
 fn main() -> io::Result<()> {
+    let mut connections: HashMap<Quad, tcp::State> = Default::default();
+
     let nic = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun)?;
     let mut buf = [0u8; 1504];
     loop {
@@ -16,33 +28,26 @@ fn main() -> io::Result<()> {
         }
 
         match etherparse::Ipv4HeaderSlice::from_slice(&buf[4..n_bytes]) {
-            Ok(p) => {
-                let src = p.source_addr();
-                let dst = p.destination_addr();
-                let proto = p.protocol();
+            Ok(iph) => {
+                let src = iph.source_addr();
+                let dst = iph.destination_addr();
+                let proto = iph.protocol();
 
                 if proto != 0x06 {
                     // not tcp
                     continue;
                 }
-                eprintln!(
-                    "{:?} -> {:?} {:?}b of protocol {:?}",
-                    src,
-                    dst,
-                    p.payload_len(),
-                    proto
-                );
 
-                match etherparse::TcpHeaderSlice::from_slice(&buf[4 + p.slice().len()..]) {
-                    Ok(p) => {
-                        eprintln!(
-                            "{:?} -> {:?} {:?}b of protocol {:?} to port {:?}",
-                            src,
-                            dst,
-                            p.slice().len(),
-                            proto,
-                            p.destination_port()
-                        );
+                match etherparse::TcpHeaderSlice::from_slice(&buf[4 + iph.slice().len()..n_bytes]) {
+                    Ok(tcph) => {
+                        let datai = 4 + iph.slice().len() + tcph.slice().len();
+                        connections
+                            .entry(Quad {
+                                src: (src, tcph.source_port()),
+                                dst: (dst, tcph.destination_port()),
+                            })
+                            .or_default()
+                            .on_packet(iph, tcph, &buf[datai..n_bytes]);
                     }
                     Err(e) => {
                         eprintln!("ignoring packet {:?}", e);
