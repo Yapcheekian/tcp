@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
 use std::net::Ipv4Addr;
@@ -13,21 +14,14 @@ struct Quad {
 }
 
 fn main() -> io::Result<()> {
-    let mut connections: HashMap<Quad, tcp::State> = Default::default();
+    let mut connections: HashMap<Quad, tcp::Connection> = Default::default();
 
-    let nic = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun)?;
+    let mut nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
     let mut buf = [0u8; 1504];
     loop {
         let n_bytes = nic.recv(&mut buf[..])?;
-        let eth_flags = u16::from_be_bytes([buf[0], buf[1]]);
-        let eth_proto = u16::from_be_bytes([buf[2], buf[3]]);
 
-        if eth_proto != 2048 {
-            // not ipv4
-            continue;
-        }
-
-        match etherparse::Ipv4HeaderSlice::from_slice(&buf[4..n_bytes]) {
+        match etherparse::Ipv4HeaderSlice::from_slice(&buf[..n_bytes]) {
             Ok(iph) => {
                 let src = iph.source_addr();
                 let dst = iph.destination_addr();
@@ -38,16 +32,31 @@ fn main() -> io::Result<()> {
                     continue;
                 }
 
-                match etherparse::TcpHeaderSlice::from_slice(&buf[4 + iph.slice().len()..n_bytes]) {
+                match etherparse::TcpHeaderSlice::from_slice(&buf[iph.slice().len()..n_bytes]) {
                     Ok(tcph) => {
-                        let datai = 4 + iph.slice().len() + tcph.slice().len();
-                        connections
-                            .entry(Quad {
-                                src: (src, tcph.source_port()),
-                                dst: (dst, tcph.destination_port()),
-                            })
-                            .or_default()
-                            .on_packet(iph, tcph, &buf[datai..n_bytes]);
+                        let datai = iph.slice().len() + tcph.slice().len();
+                        // will cause SYN flood attack when we remember the state of all incoming connections
+                        // https://www.cloudflare.com/learning/ddos/syn-flood-ddos-attack/
+                        // but we don't care about it here
+                        match connections.entry(Quad {
+                            src: (src, tcph.source_port()),
+                            dst: (dst, tcph.destination_port()),
+                        }) {
+                            Entry::Occupied(mut c) => {
+                                c.get_mut()
+                                    .on_packet(&mut nic, iph, tcph, &buf[datai..n_bytes])?;
+                            }
+                            Entry::Vacant(mut e) => {
+                                if let Some(c) = tcp::Connection::accept(
+                                    &mut nic,
+                                    iph,
+                                    tcph,
+                                    &buf[datai..n_bytes],
+                                )? {
+                                    e.insert(c);
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("ignoring packet {:?}", e);
@@ -58,11 +67,5 @@ fn main() -> io::Result<()> {
                 eprintln!("ignoring packet {:?}", e);
             }
         }
-
-        eprintln!(
-            "read {:?} bytes, flags: {:?}, proto: {:?}",
-            n_bytes, eth_flags, eth_proto
-        );
     }
-    Ok(())
 }
